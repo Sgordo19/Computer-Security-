@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""
+SSH Brute Force Detection Tool
+Monitors /var/log/auth.log for failed SSH login attempts and triggers
+an alert if 5+ failed logins occur from the same IP within 2 minutes.
+"""
+
+import re
+import time
+import sys
+import os
+from datetime import datetime, timedelta
+from collections import defaultdict
+from typing import Optional
+import argparse
+
+
+# ─── Configuration ────────────────────────────────────────────────────────────
+
+LOG_FILE          = "/var/log/auth.log"
+ALERT_THRESHOLD   = 5          # failed attempts to trigger alert
+TIME_WINDOW_SEC   = 120        # 2 minutes in seconds
+POLL_INTERVAL_SEC = 1.0        # how often to check for new log lines (tail mode)
+
+
+# ─── Log Parsing ──────────────────────────────────────────────────────────────
+
+# Matches lines like:
+#   Mar 23 14:05:32 hostname sshd[1234]: Failed password for root from 192.168.1.10 port 22 ssh2
+#   Mar 23 14:05:32 hostname sshd[1234]: Failed password for invalid user admin from 10.0.0.5 port 54321 ssh2
+FAILED_LOGIN_PATTERN = re.compile(
+    r"(?P<month>\w{3})\s+(?P<day>\d+)\s+(?P<time>\d{2}:\d{2}:\d{2})"   # timestamp
+    r".+sshd\[\d+\]:\s+Failed password for"                              # sshd service
+    r"(?:\s+invalid user)?\s+(?P<username>\S+)"                          # username
+    r"\s+from\s+(?P<ip>\d+\.\d+\.\d+\.\d+)"                             # source IP
+)
+
+
+def parse_log_line(line: str, year: int = None) -> Optional[dict]:
+    """
+    Parse a single auth.log line.
+    Returns a dict with keys: timestamp, ip, username — or None if no match.
+    """
+    match = FAILED_LOGIN_PATTERN.search(line)
+    if not match:
+        return None
+
+    year = year or datetime.now().year
+    timestamp_str = f"{match.group('month')} {match.group('day').zfill(2)} {match.group('time')} {year}"
+
+    try:
+        timestamp = datetime.strptime(timestamp_str, "%b %d %H:%M:%S %Y")
+    except ValueError:
+        return None
+
+    return {
+        "timestamp": timestamp,
+        "ip":        match.group("ip"),
+        "username":  match.group("username"),
+        "raw_line":  line.strip(),
+    }
+
+
+# ─── Detection Engine ─────────────────────────────────────────────────────────
+
+class BruteForceDetector:
+    """
+    Tracks failed SSH login attempts per IP address.
+    Fires an alert when ALERT_THRESHOLD attempts are seen within TIME_WINDOW_SEC.
+    """
+
+    def __init__(self, threshold: int = ALERT_THRESHOLD, window_sec: int = TIME_WINDOW_SEC):
+        self.threshold  = threshold
+        self.window     = timedelta(seconds=window_sec)
+        # ip -> list of {"timestamp", "username"} dicts
+        self.attempts: dict[str, list] = defaultdict(list)
+        self.alerted_ips: set = set()   # avoid duplicate alerts per burst
+
+    def _prune_old(self, ip: str, now: datetime):
+        """Remove attempts outside the time window for a given IP."""
+        cutoff = now - self.window
+        self.attempts[ip] = [a for a in self.attempts[ip] if a["timestamp"] >= cutoff]
+
+    def process_event(self, event: dict):
+        """Feed one parsed failed-login event into the detector."""
+        ip        = event["ip"]
+        username  = event["username"]
+        timestamp = event["timestamp"]
+
+        self._prune_old(ip, timestamp)
+        self.attempts[ip].append({"timestamp": timestamp, "username": username})
+
+        count = len(self.attempts[ip])
+
+        print(
+            f"  [ATTEMPT] {timestamp.strftime('%Y-%m-%d %H:%M:%S')}  "
+            f"IP: {ip:<18} User: {username:<20} "
+            f"(count in window: {count})"
+        )
+
+        if count >= self.threshold:
+            self._fire_alert(ip, timestamp)
+
+    def _fire_alert(self, ip: str, trigger_time: datetime):
+        """Print a brute-force alert."""
+        attempts = self.attempts[ip]
+        usernames = list({a["username"] for a in attempts})
+
+        alert_key = (ip, trigger_time.strftime("%Y-%m-%d %H:%M"))   # deduplicate per minute
+
+        if alert_key in self.alerted_ips:
+            return
+        self.alerted_ips.add(alert_key)
+
+        print("\n" + "═" * 65)
+        print("  🚨  BRUTE FORCE ALERT TRIGGERED")
+        print("═" * 65)
+        print(f"  Source IP  : {ip}")
+        print(f"  Time       : {trigger_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"  Attempts   : {len(attempts)} failed logins in ≤ {int(self.window.total_seconds())} seconds")
+        print(f"  Usernames  : {', '.join(usernames)}")
+        print("  Timeline   :")
+        for a in sorted(attempts, key=lambda x: x["timestamp"]):
+            print(f"             {a['timestamp'].strftime('%H:%M:%S')}  →  user: {a['username']}")
+        print("═" * 65 + "\n")
+
+
+# ─── Log Reading Modes ────────────────────────────────────────────────────────
+
+def analyze_file(log_path: str, detector: BruteForceDetector):
+    """Parse an entire existing log file (batch mode)."""
+    print(f"[*] Analyzing log file: {log_path}\n")
+
+    if not os.path.exists(log_path):
+        print(f"[ERROR] File not found: {log_path}")
+        sys.exit(1)
+
+    count = 0
+    with open(log_path, "r", errors="replace") as fh:
+        for line in fh:
+            event = parse_log_line(line)
+            if event:
+                count += 1
+                detector.process_event(event)
+
+    print(f"\n[*] Scan complete. Parsed {count} failed SSH login events.")
+
+
+def tail_file(log_path: str, detector: BruteForceDetector):
+    """
+    Live-tail the log file (like `tail -f`), feeding new lines to the detector.
+    Runs until interrupted with Ctrl-C.
+    """
+    print(f"[*] Tailing log file: {log_path}  (Ctrl-C to stop)\n")
+
+    if not os.path.exists(log_path):
+        print(f"[ERROR] File not found: {log_path}")
+        sys.exit(1)
+
+    with open(log_path, "r", errors="replace") as fh:
+        fh.seek(0, 2)          # jump to end of file
+        try:
+            while True:
+                line = fh.readline()
+                if line:
+                    event = parse_log_line(line)
+                    if event:
+                        detector.process_event(event)
+                else:
+                    time.sleep(POLL_INTERVAL_SEC)
+        except KeyboardInterrupt:
+            print("\n[*] Monitoring stopped.")
+
+
+# ─── Demo / Self-Test ─────────────────────────────────────────────────────────
+
+DEMO_LINES = [
+    # Five rapid failures from 192.168.1.100  → should trigger
+    "Mar 23 10:00:01 server sshd[1000]: Failed password for root from 192.168.1.100 port 22 ssh2",
+    "Mar 23 10:00:15 server sshd[1001]: Failed password for invalid user admin from 192.168.1.100 port 22 ssh2",
+    "Mar 23 10:00:30 server sshd[1002]: Failed password for invalid user ubuntu from 192.168.1.100 port 22 ssh2",
+    "Mar 23 10:00:45 server sshd[1003]: Failed password for root from 192.168.1.100 port 22 ssh2",
+    "Mar 23 10:01:00 server sshd[1004]: Failed password for invalid user pi from 192.168.1.100 port 22 ssh2",
+    # Only two failures from 10.0.0.5 → no alert
+    "Mar 23 10:01:05 server sshd[1005]: Failed password for root from 10.0.0.5 port 22 ssh2",
+    "Mar 23 10:01:10 server sshd[1006]: Failed password for invalid user test from 10.0.0.5 port 22 ssh2",
+    # Five failures from 172.16.0.8 but spread > 2 min → no alert
+    "Mar 23 10:02:00 server sshd[1007]: Failed password for root from 172.16.0.8 port 22 ssh2",
+    "Mar 23 10:02:30 server sshd[1008]: Failed password for root from 172.16.0.8 port 22 ssh2",
+    "Mar 23 10:03:00 server sshd[1009]: Failed password for root from 172.16.0.8 port 22 ssh2",
+    "Mar 23 10:04:00 server sshd[1010]: Failed password for root from 172.16.0.8 port 22 ssh2",
+    "Mar 23 10:05:00 server sshd[1011]: Failed password for root from 172.16.0.8 port 22 ssh2",
+]
+
+
+def run_demo(detector: BruteForceDetector):
+    """Feed synthetic log lines to demonstrate detection logic."""
+    print("[*] Running built-in demo (synthetic log lines)\n")
+    for line in DEMO_LINES:
+        event = parse_log_line(line, year=2026)
+        if event:
+            detector.process_event(event)
+    print("\n[*] Demo complete.")
+
+
+# ─── CLI Entry Point ──────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="SSH Brute Force Detector — monitors auth.log for attack patterns"
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--analyze", metavar="LOG_FILE",
+        help="Batch-scan an existing log file (default: /var/log/auth.log)"
+    )
+    group.add_argument(
+        "--tail", metavar="LOG_FILE",
+        help="Live-tail a log file and detect in real time"
+    )
+    group.add_argument(
+        "--demo", action="store_true",
+        help="Run with built-in synthetic log data (no real log file needed)"
+    )
+    parser.add_argument(
+        "--threshold", type=int, default=ALERT_THRESHOLD,
+        help=f"Failed attempts to trigger alert (default: {ALERT_THRESHOLD})"
+    )
+    parser.add_argument(
+        "--window", type=int, default=TIME_WINDOW_SEC,
+        help=f"Time window in seconds (default: {TIME_WINDOW_SEC})"
+    )
+
+    args = parser.parse_args()
+
+    detector = BruteForceDetector(threshold=args.threshold, window_sec=args.window)
+
+    print("=" * 65)
+    print("  SSH Brute Force Detector")
+    print(f"  Alert if ≥ {args.threshold} failures from same IP within {args.window}s")
+    print("=" * 65 + "\n")
+
+    if args.demo:
+        run_demo(detector)
+    elif args.tail:
+        tail_file(args.tail, detector)
+    elif args.analyze:
+        analyze_file(args.analyze, detector)
+    else:
+        # default: analyze the standard auth.log
+        analyze_file(LOG_FILE, detector)
+
+
+if __name__ == "__main__":
+    main()
