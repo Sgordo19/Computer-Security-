@@ -2,82 +2,52 @@ import os
 import hashlib
 import json
 
-# --- CONFIGURATION ---
-# We chose /var/www to protect merchant-facing web files
-MONITOR_DIR = "/var/www"
-# Baseline is stored in JSON format as required
-BASELINE_FILE = "islandpay_baseline.json"
 
-def calculate_sha256(filepath):
-    """Generates a SHA-256 hash for a specific file to detect content changes."""
-    sha256_hash = hashlib.sha256()
-    try:
-        # Open in binary mode ('rb') to read any file type correctly
-        with open(filepath, "rb") as f:
-            # Read in 4KB chunks to handle large files efficiently
-            for byte_block in iter(lambda: f.read(4096), b""):
-                sha256_hash.update(byte_block)
-        return sha256_hash.hexdigest()
-    except (PermissionError, FileNotFoundError):
-        return None
+# Change this to "/var/www" if needed
+folder_to_watch = "/etc" 
+baseline_path = "data.json"
 
-def create_baseline():
-    """Initial Scan: Scans the directory and saves the 'Gold Standard' state."""
-    print(f"[*] Creating baseline for {MONITOR_DIR}...")
-    baseline = {}
+#Create a place to store current file info
+current_files = {}
+
+# Walk through the folder and get hashes
+for root, dirs, files in os.walk(folder_to_watch):
+    for name in files:
+        full_path = os.path.join(root, name)
+        
+        try:
+            # Open file and get hash
+            file_data = open(full_path, "rb").read()
+            file_hash = hashlib.sha256(file_data).hexdigest()
+            current_files[full_path] = file_hash
+        except:
+            continue
+
+# Check if we have a baseline yet
+ if os.path.exists(baseline_path) == False:
+    # Save the current state as the baseline
+    print("No baseline found. Saving current files...")
+    f = open(baseline_path, "w")
+    json.dump(current_files, f)
+    f.close()
+    print("Done!")
+else:
+    # Load the old baseline to compare
+    f = open(baseline_path, "r")
+    old_files = json.load(f)
+    f.close()
+
+    # Look for changes
+    print("Checking for changes...")
     
-    # Recursively walk through the directory to find every file
-    for root, _, files in os.walk(MONITOR_DIR):
-        for name in files:
-            filepath = os.path.join(root, name)
-            file_hash = calculate_sha256(filepath)
-            if file_hash:
-                baseline[filepath] = file_hash
-    
-    # Save the baseline hashes to the JSON file
-    with open(BASELINE_FILE, "w") as f:
-        json.dump(baseline, f, indent=4)
-    print(f"[+] Baseline successfully saved to {BASELINE_FILE}")
+    # Check for Modified or New files
+    for path in current_files:
+        if path not in old_files:
+            print("NEW FILE FOUND: " + path)
+        elif current_files[path] != old_files[path]:
+            print("FILE WAS MODIFIED: " + path)
 
-def run_integrity_check():
-    """Comparison Scan: Detects modified, new, or deleted files against the baseline."""
-    # Ensure a baseline exists before trying to compare
-    if not os.path.exists(BASELINE_FILE):
-        print("[!] No baseline found. Run the script once to create it.")
-        create_baseline()
-        return
-
-    # Load the trusted baseline data
-    with open(BASELINE_FILE, "r") as f:
-        baseline = json.load(f)
-
-    # Perform a fresh scan of the current files
-    current_files = {}
-    for root, _, files in os.walk(MONITOR_DIR):
-        for name in files:
-            filepath = os.path.join(root, name)
-            file_hash = calculate_sha256(filepath)
-            if file_hash:
-                current_files[filepath] = file_hash
-
-    # --- DETECTION LOGIC ---
-    
-    # 1. Check for NEW or MODIFIED files
-    for path, current_hash in current_files.items():
-        if path not in baseline:
-            print(f"[ALERT] NEW FILE DETECTED: {path}")
-        elif current_hash != baseline[path]:
-            print(f"[ALERT] FILE MODIFIED: {path}")
-
-    # 2. Check for DELETED files
-    for path in baseline:
+    # Check for Deleted files
+    for path in old_files:
         if path not in current_files:
-            print(f"[ALERT] FILE DELETED: {path}")
-
-if __name__ == "__main__":
-    # If the JSON file doesn't exist, create it. Otherwise, scan for changes.
-    if not os.path.exists(BASELINE_FILE):
-        create_baseline()
-    else:
-        print(f"[*] Starting Integrity Scan for IslandPay...")
-        run_integrity_check()
+            print("FILE WAS DELETED: " + path)
