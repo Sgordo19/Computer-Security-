@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""
+logger.py - Section C
+
+Log format:
+    TIMESTAMP | EVENT_TYPE | SEVERITY | SOURCE | DESCRIPTION
+"""
+
+import os
+from datetime import datetime
+
+# Valid severity levels
+SEVERITY_LEVELS = {"Low", "Medium", "High"}
+
+
+class HIDSLogger:
+    """Writes structured security event entries to hids.log."""
+
+    def __init__(self, log_file: str = "hids.log"):
+        self.log_file = log_file
+        self._ensure_log_exists()
+
+    def log_event(self, event_type: str, severity: str, source: str, description: str) -> None:
+        """Append a single security event to hids.log."""
+
+        # Default to Medium if an invalid severity is passed
+        if severity not in SEVERITY_LEVELS:
+            severity = "Medium"
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Remove pipe characters from field values to protect the log format
+        def clean(value: str) -> str:
+            return str(value).replace("|", "/")
+
+        # Build the log entry with padded columns for readability
+        entry = (
+            f"{timestamp} | "
+            f"{clean(event_type):<20} | "
+            f"{clean(severity):<6} | "
+            f"{clean(source):<40} | "
+            f"{clean(description)}\n"
+        )
+
+        # Append to hids.log
+        with open(self.log_file, "a") as log:
+            log.write(entry)
+
+        print(f"[LOG] {timestamp} | {clean(event_type)} | {clean(severity)} | {clean(source)}")
+
+    def view_log(self, last_n: int = 20) -> None:
+        """Print the last N entries from hids.log to the terminal."""
+        if not os.path.exists(self.log_file):
+            print(f"[LOG] Log file '{self.log_file}' does not exist yet.")
+            return
+
+        with open(self.log_file, "r") as log:
+            lines = log.readlines()
+
+        print(f"\n{'=' * 100}")
+        print(f"  hids.log - last {last_n} entries")
+        print(f"{'=' * 100}")
+
+        # Skip comment header lines
+        data_lines = [line for line in lines if not line.startswith("#")]
+        for line in data_lines[-last_n:]:
+            print(" ", line.rstrip())
+
+        print(f"{'=' * 100}\n")
+
+    def _ensure_log_exists(self) -> None:
+        """Create hids.log with a header if it does not already exist."""
+        if not os.path.exists(self.log_file):
+            header = (
+                "# IslandPay HIDS - Centralized Incident Log\n"
+                "# Format: TIMESTAMP | EVENT_TYPE | SEVERITY | SOURCE | DESCRIPTION\n"
+                "# Severity levels: Low | Medium | High\n"
+                "# " + "-" * 90 + "\n"
+            )
+            with open(self.log_file, "w") as log:
+                log.write(header)
+            print(f"[LOG] Log file created: {self.log_file}")
+
+
+# --- Demo (runs when this file is executed directly) ---
+if __name__ == "__main__":
+
+    logger = HIDSLogger("hids.log")
+
+    logger.log_event(
+        event_type  = "SYSTEM_START",
+        severity    = "Low",
+        source      = "hids.py",
+        description = "HIDS started successfully."
+    )
+
+    logger.log_event(
+        event_type  = "FILE_MODIFIED",
+        severity    = "High",
+        source      = "/var/www/html/index.html",
+        description = "Hash changed. Old: f4b3114b... New: 9ca8db79... Possible web-shell injection."
+    )
+
+    logger.log_event(
+        event_type  = "FILE_ADDED",
+        severity    = "Medium",
+        source      = "/var/www/html/shell.php",
+        description = "Unexpected new file detected. Hash: d7ad923c..."
+    )
+
+    logger.log_event(
+        event_type  = "FILE_DELETED",
+        severity    = "High",
+        source      = "/etc/hosts",
+        description = "File removed from monitored directory. Last known hash: 85e4edeb..."
+    )
+
+    logger.log_event(
+        event_type  = "SSH_BRUTE_FORCE",
+        severity    = "High",
+        source      = "192.168.1.99",
+        description = "6 failed SSH logins within 2 minutes. Usernames: root, admin, ubuntu, pi, deploy."
+    )
+
+    logger.view_log()
