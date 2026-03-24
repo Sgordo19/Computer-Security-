@@ -1,1 +1,96 @@
+#!/usr/bin/env python3
 
+"""
+Runs file monitoring, SSH detection, logging, and alerting.
+"""
+
+import time
+from file_monitor import run_file_check
+from logger import log_event
+from alert import send_alert
+
+from ssh_detector import parse_log_line, BruteForceDetector, LOG_FILE as AUTH_LOG
+
+
+SCAN_INTERVAL = 60
+
+
+def run_ssh_scan():
+    """
+    Returns list of alert messages.
+    """
+    alerts = []
+    detector = BruteForceDetector()
+
+    try:
+        with open(AUTH_LOG, "r", errors="ignore") as f:
+            for line in f:
+                event = parse_log_line(line)
+                if event:
+                    detector.process_event(event)
+
+        # Extract alerts manually from detector state
+        for ip, attempts in detector.attempts.items():
+            if len(attempts) >= detector.threshold:
+                usernames = list({a["username"] for a in attempts})
+                msg = (
+                    f"SSH BRUTE FORCE DETECTED: {ip} "
+                    f"({len(attempts)} attempts, users: {', '.join(usernames)})"
+                )
+                alerts.append(msg)
+
+                log_event(
+                    "SSH_BRUTE_FORCE",
+                    "High",
+                    ip,
+                    "Multiple failed login attempts detected"
+                )
+
+    except Exception as e:
+        print(f"[ERROR] SSH scan failed: {e}")
+
+    return alerts
+
+
+def run_cycle():
+    """Run one full detection cycle."""
+    
+    print("\n[+] Running HIDS checks...")
+
+    # FILE CHECK
+    file_alerts = run_file_check()
+
+    ssh_alerts = run_ssh_scan()
+
+    all_alerts = file_alerts + ssh_alerts
+
+    if all_alerts:
+        print(f"[!] {len(all_alerts)} alert(s) found")
+        for alert in all_alerts:
+            send_alert(alert)
+    else:
+        print("[+] System clean")
+
+    return len(all_alerts)
+
+
+def main():
+    print("=== HIDS Monitoring Started ===")
+    log_event("SYSTEM", "INFO", "hids.py", "Monitoring started")
+
+    try:
+        while True:
+            count = run_cycle()
+
+            print(f"[+] Cycle done. Alerts: {count}")
+            print(f"[+] Sleeping for {SCAN_INTERVAL} seconds...\n")
+
+            time.sleep(SCAN_INTERVAL)
+
+    except KeyboardInterrupt:
+        print("\n[!] HIDS stopped.")
+        log_event("SYSTEM", "INFO", "hids.py", "Monitoring stopped")
+
+
+if __name__ == "__main__":
+    main()
