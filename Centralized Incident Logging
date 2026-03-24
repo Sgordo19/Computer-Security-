@@ -82,7 +82,6 @@ class HIDSLogger:
             print(f"[LOG] Log file created: {self.log_file}")
 
 
-# --- Demo (runs when this file is executed directly) ---
 if __name__ == "__main__":
 
     logger = HIDSLogger("hids.log")
