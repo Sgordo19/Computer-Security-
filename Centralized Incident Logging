@@ -1,39 +1,49 @@
 #!/usr/bin/env python3
 """
-logger.py - Section C
+logger.py
+Centralized incident logging for the HIDS system.
 
 Log format:
-    TIMESTAMP | EVENT_TYPE | SEVERITY | SOURCE | DESCRIPTION
+    TIMESTAMP | EVENT_TYPE           | SEVERITY | SOURCE                                   | DESCRIPTION
 """
 
 import os
 from datetime import datetime
 
 # Valid severity levels
-SEVERITY_LEVELS = {"Low", "Medium", "High"}
+SEVERITY_LEVELS = {"Low", "Medium", "High", "INFO"}   # INFO added for system events
 
+_DEFAULT_LOG_FILE = "hids.log"
+
+# ─── Logger Class ─────────────────────────────────────────────────────────────
 
 class HIDSLogger:
     """Writes structured security event entries to hids.log."""
 
-    def __init__(self, log_file: str = "hids.log"):
+    def __init__(self, log_file: str = _DEFAULT_LOG_FILE):
         self.log_file = log_file
         self._ensure_log_exists()
 
-    def log_event(self, event_type: str, severity: str, source: str, description: str) -> None:
-        """Append a single security event to hids.log."""
+    # ── Public API ────────────────────────────────────────────────────────────
 
-        # Default to Medium if an invalid severity is passed
+    def log_event(
+        self,
+        event_type:  str,
+        severity:    str,
+        source:      str,
+        description: str,
+    ) -> None:
+        """Append a single security event to hids.log."""
+        # Default to Medium if an unrecognised severity is passed
         if severity not in SEVERITY_LEVELS:
             severity = "Medium"
 
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # Remove pipe characters from field values to protect the log format
         def clean(value: str) -> str:
+            """Remove pipe characters to protect the log format."""
             return str(value).replace("|", "/")
 
-        # Build the log entry with padded columns for readability
         entry = (
             f"{timestamp} | "
             f"{clean(event_type):<20} | "
@@ -42,7 +52,6 @@ class HIDSLogger:
             f"{clean(description)}\n"
         )
 
-        # Append to hids.log
         with open(self.log_file, "a") as log:
             log.write(entry)
 
@@ -58,7 +67,7 @@ class HIDSLogger:
             lines = log.readlines()
 
         print(f"\n{'=' * 100}")
-        print(f"  hids.log - last {last_n} entries")
+        print(f"  hids.log — last {last_n} entries")
         print(f"{'=' * 100}")
 
         # Skip comment header lines
@@ -68,8 +77,10 @@ class HIDSLogger:
 
         print(f"{'=' * 100}\n")
 
+    # ── Internal ──────────────────────────────────────────────────────────────
+
     def _ensure_log_exists(self) -> None:
-        """Create hids.log with a header if it does not already exist."""
+        """Create hids.log with a header comment block if it does not exist."""
         if not os.path.exists(self.log_file):
             header = (
                 "# IslandPay HIDS - Centralized Incident Log\n"
@@ -82,43 +93,39 @@ class HIDSLogger:
             print(f"[LOG] Log file created: {self.log_file}")
 
 
-if __name__ == "__main__":
+# ─── Module-level convenience function ───────────────────────────────────────
+# hids.py calls  log_event(...)  directly (not through an instance), so we
+# expose a module-level wrapper backed by a shared singleton logger.
 
+_shared_logger: HIDSLogger | None = None
+
+
+def _get_logger() -> HIDSLogger:
+    global _shared_logger
+    if _shared_logger is None:
+        _shared_logger = HIDSLogger()
+    return _shared_logger
+
+
+def log_event(event_type: str, severity: str, source: str, description: str) -> None:
+    """Module-level shortcut used by hids.py."""
+    _get_logger().log_event(event_type, severity, source, description)
+
+
+# ─── Standalone demo / test ───────────────────────────────────────────────────
+
+if __name__ == "__main__":
     logger = HIDSLogger("hids.log")
 
-    logger.log_event(
-        event_type  = "SYSTEM_START",
-        severity    = "Low",
-        source      = "hids.py",
-        description = "HIDS started successfully."
-    )
-
-    logger.log_event(
-        event_type  = "FILE_MODIFIED",
-        severity    = "High",
-        source      = "/var/www/html/index.html",
-        description = "Hash changed. Old: f4b3114b... New: 9ca8db79... Possible web-shell injection."
-    )
-
-    logger.log_event(
-        event_type  = "FILE_ADDED",
-        severity    = "Medium",
-        source      = "/var/www/html/shell.php",
-        description = "Unexpected new file detected. Hash: d7ad923c..."
-    )
-
-    logger.log_event(
-        event_type  = "FILE_DELETED",
-        severity    = "High",
-        source      = "/etc/hosts",
-        description = "File removed from monitored directory. Last known hash: 85e4edeb..."
-    )
-
-    logger.log_event(
-        event_type  = "SSH_BRUTE_FORCE",
-        severity    = "High",
-        source      = "192.168.1.99",
-        description = "6 failed SSH logins within 2 minutes. Usernames: root, admin, ubuntu, pi, deploy."
-    )
+    logger.log_event("SYSTEM_START",  "Low",    "hids.py",
+                     "HIDS started successfully.")
+    logger.log_event("FILE_MODIFIED", "High",   "/var/www/html/index.html",
+                     "Hash changed. Old: f4b3114b... New: 9ca8db79... Possible web-shell injection.")
+    logger.log_event("FILE_ADDED",    "Medium", "/var/www/html/shell.php",
+                     "Unexpected new file detected. Hash: d7ad923c...")
+    logger.log_event("FILE_DELETED",  "High",   "/etc/hosts",
+                     "File removed from monitored directory. Last known hash: 85e4edeb...")
+    logger.log_event("SSH_BRUTE_FORCE", "High", "192.168.1.99",
+                     "6 failed SSH logins within 2 minutes. Usernames: root, admin, ubuntu, pi, deploy.")
 
     logger.view_log()
