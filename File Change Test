@@ -1,53 +1,155 @@
+#!/usr/bin/env python3
+"""
+file_monitor.py
+Monitors a target directory for file additions, modifications, and deletions
+using SHA-256 hashes. Stores a baseline in data.json and compares on each run.
+"""
+
 import os
 import hashlib
 import json
+from typing import Optional
+
+# ─── Configuration ────────────────────────────────────────────────────────────
+
+FOLDER_TO_WATCH = "/etc"          # Directory to monitor
+BASELINE_PATH   = "data.json"     # Persisted baseline snapshot
 
 
-# Change this to "/var/www" if needed
-folder_to_watch = "/etc" 
-baseline_path = "data.json"
+# ─── Hashing ──────────────────────────────────────────────────────────────────
 
-#Create a place to store current file info
-current_files = {}
+def hash_file(path: str) -> Optional[str]:
+    """Return the SHA-256 hex digest of a file, or None on read error."""
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except (OSError, PermissionError):
+        return None
 
-# Walk through the folder and get hashes
-for root, dirs, files in os.walk(folder_to_watch):
-    for name in files:
-        full_path = os.path.join(root, name)
-        
-        try:
-            # Open file and get hash
-            file_data = open(full_path, "rb").read()
-            file_hash = hashlib.sha256(file_data).hexdigest()
-            current_files[full_path] = file_hash
-        except:
-            continue
 
-# Check if we have a baseline yet
- if os.path.exists(baseline_path) == False:
-    # Save the current state as the baseline
-    print("No baseline found. Saving current files...")
-    f = open(baseline_path, "w")
-    json.dump(current_files, f)
-    f.close()
-    print("Done!")
-else:
-    # Load the old baseline to compare
-    f = open(baseline_path, "r")
-    old_files = json.load(f)
-    f.close()
+def snapshot_directory(folder: str) -> dict[str, str]:
+    """
+    Walk *folder* recursively and return a dict of {filepath: sha256_hash}.
+    Files that cannot be read are silently skipped.
+    """
+    files: dict[str, str] = {}
+    for root, _dirs, names in os.walk(folder):
+        for name in names:
+            full_path = os.path.join(root, name)
+            digest = hash_file(full_path)
+            if digest is not None:
+                files[full_path] = digest
+    return files
 
-    # Look for changes
-    print("Checking for changes...")
-    
-    # Check for Modified or New files
-    for path in current_files:
-        if path not in old_files:
-            print("NEW FILE FOUND: " + path)
-        elif current_files[path] != old_files[path]:
-            print("FILE WAS MODIFIED: " + path)
 
-    # Check for Deleted files
-    for path in old_files:
-        if path not in current_files:
-            print("FILE WAS DELETED: " + path)
+# ─── Baseline Persistence ─────────────────────────────────────────────────────
+
+def load_baseline(path: str) -> Optional[dict[str, str]]:
+    """Load a previously saved baseline from *path*, or return None if absent."""
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r") as fh:
+            return json.load(fh)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def save_baseline(snapshot: dict[str, str], path: str) -> None:
+    """Persist *snapshot* as the new baseline at *path*."""
+    with open(path, "w") as fh:
+        json.dump(snapshot, fh, indent=2)
+
+
+# ─── Comparison ───────────────────────────────────────────────────────────────
+
+def compare_snapshots(
+    old: dict[str, str],
+    new: dict[str, str],
+) -> tuple[list[str], list[str], list[str]]:
+    """
+    Compare two snapshots and return (new_files, modified_files, deleted_files).
+    Each list contains the affected file paths.
+    """
+    new_files      = [p for p in new if p not in old]
+    modified_files = [p for p in new if p in old and new[p] != old[p]]
+    deleted_files  = [p for p in old if p not in new]
+    return new_files, modified_files, deleted_files
+
+
+# ─── Main Check ───────────────────────────────────────────────────────────────
+
+def run_file_check(
+    folder: str = FOLDER_TO_WATCH,
+    baseline_path: str = BASELINE_PATH,
+) -> list[str]:
+    """
+    Run one integrity check cycle.
+
+    - If no baseline exists, create one and return an empty alert list.
+    - Otherwise, compare the current state against the baseline and return
+      a list of alert strings describing every change found.
+    """
+    alerts: list[str] = []
+
+    current = snapshot_directory(folder)
+    old     = load_baseline(baseline_path)
+
+    if old is None:
+        print(f"[FILE MONITOR] No baseline found for '{folder}'. Saving current state as baseline...")
+        save_baseline(current, baseline_path)
+        print(f"[FILE MONITOR] Baseline saved ({len(current)} files). Future runs will detect changes.")
+        return alerts   # nothing to compare yet
+
+    print(f"[FILE MONITOR] Checking '{folder}' against baseline ({len(old)} files recorded)...")
+
+    new_files, modified_files, deleted_files = compare_snapshots(old, current)
+
+    for path in new_files:
+        msg = f"NEW FILE FOUND: {path}"
+        print(f"  [!] {msg}")
+        alerts.append(msg)
+
+    for path in modified_files:
+        msg = f"FILE WAS MODIFIED: {path}  (old: {old[path][:12]}…  new: {current[path][:12]}…)"
+        print(f"  [!] {msg}")
+        alerts.append(msg)
+
+    for path in deleted_files:
+        msg = f"FILE WAS DELETED: {path}  (last hash: {old[path][:12]}…)"
+        print(f"  [!] {msg}")
+        alerts.append(msg)
+
+    if not alerts:
+        print("[FILE MONITOR] No changes detected.")
+
+    # Update the baseline to the current state so deleted files
+    # are not reported again on the next cycle.
+    save_baseline(current, baseline_path)
+
+    return alerts
+
+
+# ─── Standalone CLI ───────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="File Integrity Monitor")
+    parser.add_argument("--folder",   default=FOLDER_TO_WATCH, help="Directory to watch")
+    parser.add_argument("--baseline", default=BASELINE_PATH,   help="Path to baseline JSON file")
+    parser.add_argument("--reset",    action="store_true",      help="Delete baseline and create a fresh one")
+    args = parser.parse_args()
+
+    if args.reset and os.path.exists(args.baseline):
+        os.remove(args.baseline)
+        print(f"[FILE MONITOR] Baseline '{args.baseline}' removed.")
+
+    found = run_file_check(folder=args.folder, baseline_path=args.baseline)
+
+    if found:
+        print(f"\n[FILE MONITOR] {len(found)} alert(s):")
+        for alert in found:
+            print(f"  • {alert}")
+    else:
+        print("[FILE MONITOR] System clean.")
