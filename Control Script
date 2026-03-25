@@ -1,68 +1,98 @@
 #!/usr/bin/env python3
-
 """
-Runs file monitoring, SSH detection, logging, and alerting.
+hids.py — Host-Based Intrusion Detection System (Control Script)
+Orchestrates file integrity monitoring, SSH brute-force detection,
+centralized logging, and desktop/file alerting.
+
+Usage:
+    python hids.py               # continuous loop (Ctrl-C to stop)
+    python hids.py --once        # run a single detection cycle and exit
+    python hids.py --demo        # run the SSH demo with synthetic data and exit
 """
 
 import time
-from file_monitor import run_file_check
-from logger import log_event
-from alert import send_alert
+import argparse
 
-from ssh_detector import parse_log_line, BruteForceDetector, LOG_FILE as AUTH_LOG
+from file_monitor  import run_file_check
+from logger        import log_event
+from alert         import send_alert
+from ssh_detector  import parse_log_line, BruteForceDetector, LOG_FILE as AUTH_LOG, run_demo
+
+# ─── Configuration ────────────────────────────────────────────────────────────
+
+SCAN_INTERVAL = 60   # seconds between detection cycles
 
 
-SCAN_INTERVAL = 60
+# ─── SSH Detection ────────────────────────────────────────────────────────────
 
-
-def run_ssh_scan():
+def run_ssh_scan() -> list[str]:
     """
-    Returns list of alert messages.
+    Scan AUTH_LOG for brute-force patterns.
+
+    Uses the BruteForceDetector's _pending_alerts list (populated inside
+    _fire_alert) so alerts are only raised when the threshold is actually met
+    within the sliding time window — not just whenever an IP has >= N entries
+    in total.
+
+    Returns a list of alert message strings.
     """
-    alerts = []
     detector = BruteForceDetector()
 
     try:
-        with open(AUTH_LOG, "r", errors="ignore") as f:
-            for line in f:
+        with open(AUTH_LOG, "r", errors="ignore") as fh:
+            for line in fh:
                 event = parse_log_line(line)
                 if event:
                     detector.process_event(event)
+    except FileNotFoundError:
+        print(f"[SSH] Log file not found: {AUTH_LOG}  (skipping SSH scan)")
+        return []
+    except Exception as exc:
+        print(f"[ERROR] SSH scan failed: {exc}")
+        return []
 
-        # Extract alerts manually from detector state
-        for ip, attempts in detector.attempts.items():
-            if len(attempts) >= detector.threshold:
-                usernames = list({a["username"] for a in attempts})
-                msg = (
-                    f"SSH BRUTE FORCE DETECTED: {ip} "
-                    f"({len(attempts)} attempts, users: {', '.join(usernames)})"
-                )
-                alerts.append(msg)
+    # Collect alerts that were fired during processing
+    alerts = detector.pop_alerts()
 
-                log_event(
-                    "SSH_BRUTE_FORCE",
-                    "High",
-                    ip,
-                    "Multiple failed login attempts detected"
-                )
-
-    except Exception as e:
-        print(f"[ERROR] SSH scan failed: {e}")
+    # Write a HIDS log entry for every alert
+    for alert_msg in alerts:
+        # Extract the IP from the message for the source field
+        parts  = alert_msg.split(":")
+        source = parts[1].strip().split(" ")[0] if len(parts) > 1 else "unknown"
+        log_event(
+            "SSH_BRUTE_FORCE",
+            "High",
+            source,
+            "Multiple failed login attempts detected",
+        )
 
     return alerts
 
 
-def run_cycle():
-    """Run one full detection cycle."""
-    
+# ─── Single Detection Cycle ───────────────────────────────────────────────────
+
+def run_cycle() -> int:
+    """
+    Run one full detection cycle (file check + SSH scan).
+    Sends alerts for every finding and returns the total alert count.
+    """
     print("\n[+] Running HIDS checks...")
 
-    # FILE CHECK
     file_alerts = run_file_check()
+    ssh_alerts  = run_ssh_scan()
+    all_alerts  = file_alerts + ssh_alerts
 
-    ssh_alerts = run_ssh_scan()
-
-    all_alerts = file_alerts + ssh_alerts
+    # Log every file alert
+    for alert in file_alerts:
+        a = alert.lower()
+        if "modified" in a:
+            etype, sev = "FILE_MODIFIED", "High"
+        elif "deleted" in a:
+            etype, sev = "FILE_DELETED",  "High"
+        else:
+            etype, sev = "FILE_ADDED",    "Medium"
+        source = alert.split(":")[-1].strip().split(" ")[0] if ":" in alert else "unknown"
+        log_event(etype, sev, source, alert)
 
     if all_alerts:
         print(f"[!] {len(all_alerts)} alert(s) found")
@@ -74,17 +104,44 @@ def run_cycle():
     return len(all_alerts)
 
 
-def main():
-    print("=== HIDS Monitoring Started ===")
+# ─── Entry Point ──────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="HIDS — Host-Based Intrusion Detection System")
+    group  = parser.add_mutually_exclusive_group()
+    group.add_argument("--once", action="store_true",
+                       help="Run a single detection cycle and exit")
+    group.add_argument("--demo", action="store_true",
+                       help="Run the SSH brute-force demo with synthetic data and exit")
+    args = parser.parse_args()
+
+    print("=" * 65)
+    print("  HIDS Monitoring Started")
+    print("=" * 65)
     log_event("SYSTEM", "INFO", "hids.py", "Monitoring started")
 
     try:
+        if args.demo:
+            # Run SSH demo only — no real log file needed
+            detector = BruteForceDetector()
+            run_demo(detector)
+            alerts = detector.pop_alerts()
+            for msg in alerts:
+                send_alert(msg)
+            log_event("SYSTEM", "INFO", "hids.py", "Demo completed")
+            return
+
+        if args.once:
+            count = run_cycle()
+            print(f"[+] Cycle done. Alerts: {count}")
+            log_event("SYSTEM", "INFO", "hids.py", f"Single cycle completed. Alerts: {count}")
+            return
+
+        # Continuous monitoring loop
         while True:
             count = run_cycle()
-
             print(f"[+] Cycle done. Alerts: {count}")
-            print(f"[+] Sleeping for {SCAN_INTERVAL} seconds...\n")
-
+            print(f"[+] Sleeping for {SCAN_INTERVAL} seconds…\n")
             time.sleep(SCAN_INTERVAL)
 
     except KeyboardInterrupt:
