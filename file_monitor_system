@@ -1,59 +1,155 @@
+#!/usr/bin/env python3
+"""
+file_monitor.py - File Integrity Monitoring for IslandPay HIDS
+
+Monitors exactly one directory, generates SHA-256 hashes,
+stores the baseline in JSON, and detects:
+- modified files
+- new files
+- deleted files
+"""
+
 import os
 import hashlib
 import json
+from datetime import datetime
+from logger import log_event
 
+# Choose ONE monitored directory only
 MONITOR_DIR = "./monitor_dir"
 BASELINE_FILE = "baseline.json"
 
 
-def hash_file(path):
-    h = hashlib.sha256()
+def hash_file(filepath):
+    """Generate SHA-256 hash of a single file."""
+    sha256 = hashlib.sha256()
+
     try:
-        with open(path, "rb") as f:
-            while chunk := f.read(4096):
-                h.update(chunk)
-        return h.hexdigest()
-    except:
+        with open(filepath, "rb") as file:
+            for chunk in iter(lambda: file.read(4096), b""):
+                sha256.update(chunk)
+        return sha256.hexdigest()
+    except (PermissionError, FileNotFoundError, IsADirectoryError):
         return None
 
 
-def scan_directory():
-    file_hashes = {}
-    for root, _, files in os.walk(MONITOR_DIR):
-        for f in files:
-            path = os.path.join(root, f)
-            file_hashes[path] = hash_file(path)
-    return file_hashes
+def scan_directory(directory):
+    """Walk through the monitored directory and hash each readable file."""
+    hashes = {}
+
+    for root, dirs, files in os.walk(directory):
+        for filename in files:
+            full_path = os.path.join(root, filename)
+            file_hash = hash_file(full_path)
+
+            if file_hash is not None:
+                hashes[full_path] = file_hash
+
+    return hashes
+
+
+def save_baseline(hashes):
+    """Save the current file hashes to a JSON baseline file."""
+    data = {
+        "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "directory": MONITOR_DIR,
+        "files": hashes
+    }
+
+    try:
+        with open(BASELINE_FILE, "w") as file:
+            json.dump(data, file, indent=2)
+        print(f"[+] Baseline saved to {BASELINE_FILE}")
+    except Exception as e:
+        print(f"[ERROR] Failed to save baseline: {e}")
 
 
 def load_baseline():
+    """Load the existing baseline. Return None if it does not exist."""
     if not os.path.exists(BASELINE_FILE):
-        return {}
-    with open(BASELINE_FILE, "r") as f:
-        return json.load(f)
+        return None
 
-
-def save_baseline(data):
-    with open(BASELINE_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+    try:
+        with open(BASELINE_FILE, "r") as file:
+            data = json.load(file)
+        return data.get("files", {})
+    except Exception as e:
+        print(f"[ERROR] Failed to load baseline: {e}")
+        return None
 
 
 def run_file_check():
+    """
+    Compare current hashes to the saved baseline and detect:
+    - modified files
+    - new files
+    - deleted files
+    """
     alerts = []
-
-    current = scan_directory()
     baseline = load_baseline()
 
-    # Detect changes
-    for file in current:
-        if file not in baseline:
-            alerts.append(f"New file detected: {file}")
-        elif current[file] != baseline[file]:
-            alerts.append(f"File modified: {file}")
+    # First run: create baseline only
+    if baseline is None:
+        print("[*] No baseline found. Creating baseline now...")
+        current_hashes = scan_directory(MONITOR_DIR)
+        save_baseline(current_hashes)
+        log_event(
+            "BASELINE_CREATED",
+            "Low",
+            MONITOR_DIR,
+            f"Initial SHA-256 baseline created for {MONITOR_DIR}"
+        )
+        return alerts
 
-    for file in baseline:
-        if file not in current:
-            alerts.append(f"File deleted: {file}")
+    current_hashes = scan_directory(MONITOR_DIR)
 
-    save_baseline(current)
+    # Detect deleted and modified files
+    for filepath, old_hash in baseline.items():
+        if filepath not in current_hashes:
+            msg = f"FILE DELETED: {filepath}"
+            print(f"[!] {msg}")
+            log_event(
+                "FILE_DELETED",
+                "High",
+                filepath,
+                "File was deleted from monitored directory"
+            )
+            alerts.append(msg)
+
+        elif current_hashes[filepath] != old_hash:
+            msg = f"FILE MODIFIED: {filepath}"
+            print(f"[!] {msg}")
+            log_event(
+                "FILE_MODIFIED",
+                "High",
+                filepath,
+                "SHA-256 hash changed; possible tampering detected"
+            )
+            alerts.append(msg)
+
+    # Detect new files
+    for filepath in current_hashes:
+        if filepath not in baseline:
+            msg = f"NEW FILE DETECTED: {filepath}"
+            print(f"[!] {msg}")
+            log_event(
+                "FILE_ADDED",
+                "Medium",
+                filepath,
+                "New file detected in monitored directory"
+            )
+            alerts.append(msg)
+
+    if not alerts:
+        print("[+] File integrity check passed. No changes detected.")
+        log_event(
+            "FILE_CHECK_OK",
+            "Low",
+            MONITOR_DIR,
+            "No file changes detected during scan"
+        )
+
+    # Update baseline after each scan
+    save_baseline(current_hashes)
+
     return alerts
