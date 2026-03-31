@@ -1,0 +1,54 @@
+import re
+from collections import defaultdict
+from datetime import datetime, timedelta
+
+LOG_FILE = "/var/log/auth.log"
+
+
+class BruteForceDetector:
+    def __init__(self):
+        self.attempts = defaultdict(list)
+        self.alerts = []
+
+    def process_event(self, event):
+        ip = event["ip"]
+        time = event["time"]
+
+        self.attempts[ip].append(time)
+
+        # Keep only last 2 minutes
+        self.attempts[ip] = [
+            t for t in self.attempts[ip]
+            if time - t <= timedelta(minutes=2)
+        ]
+
+        if len(self.attempts[ip]) >= 5:
+            msg = f"Brute force detected from: {ip}"
+            self.alerts.append(msg)
+            self.attempts[ip] = []
+
+    def pop_alerts(self):
+        a = self.alerts[:]
+        self.alerts.clear()
+        return a
+
+
+def parse_log_line(line):
+    pattern = r"(\w{3} \d+ \d+:\d+:\d+).*Failed password.*from (\d+\.\d+\.\d+\.\d+)"
+    match = re.search(pattern, line)
+
+    if not match:
+        return None
+
+    time_str, ip = match.groups()
+    time = datetime.strptime(time_str, "%b %d %H:%M:%S")
+
+    return {"ip": ip, "time": time}
+
+
+def run_demo(detector):
+    now = datetime.now()
+    ip = "192.168.1.100"
+
+    for i in range(5):
+        detector.process_event({"ip": ip, "time": now})
