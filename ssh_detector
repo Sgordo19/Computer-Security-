@@ -1,54 +1,137 @@
+#!/usr/bin/env python3
+"""
+ssh_detector.py - SSH brute-force detection for IslandPay HIDS
+
+Parses /var/log/auth.log and triggers an alert if:
+- 5 failed logins
+- from the same IP
+- within 2 minutes
+"""
+
 import re
-from collections import defaultdict
 from datetime import datetime, timedelta
+from collections import defaultdict
+from logger import log_event
 
-LOG_FILE = "/var/log/auth.log"
-
-
-class BruteForceDetector:
-    def __init__(self):
-        self.attempts = defaultdict(list)
-        self.alerts = []
-
-    def process_event(self, event):
-        ip = event["ip"]
-        time = event["time"]
-
-        self.attempts[ip].append(time)
-
-        # Keep only last 2 minutes
-        self.attempts[ip] = [
-            t for t in self.attempts[ip]
-            if time - t <= timedelta(minutes=2)
-        ]
-
-        if len(self.attempts[ip]) >= 5:
-            msg = f"Brute force detected from: {ip}"
-            self.alerts.append(msg)
-            self.attempts[ip] = []
-
-    def pop_alerts(self):
-        a = self.alerts[:]
-        self.alerts.clear()
-        return a
+AUTH_LOG = "/var/log/auth.log"
+FAILED_LOGIN_THRESHOLD = 5
+TIME_WINDOW_MINUTES = 2
 
 
-def parse_log_line(line):
-    pattern = r"(\w{3} \d+ \d+:\d+:\d+).*Failed password.*from (\d+\.\d+\.\d+\.\d+)"
-    match = re.search(pattern, line)
+def parse_auth_log():
+    """
+    Parse /var/log/auth.log and extract:
+    - IP address
+    - username
+    - timestamp
 
-    if not match:
-        return None
+    Expected log example:
+    Mar 31 22:15:01 hostname sshd[1234]: Failed password for invalid user admin from 192.168.1.10 port 22 ssh2
+    """
+    failed_attempts = []
 
-    time_str, ip = match.groups()
-    time = datetime.strptime(time_str, "%b %d %H:%M:%S")
+    pattern = re.compile(
+        r"^(\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2}).*Failed password for (?:invalid user )?(\S+) from (\d+\.\d+\.\d+\.\d+)"
+    )
 
-    return {"ip": ip, "time": time}
+    try:
+        with open(AUTH_LOG, "r", errors="ignore") as file:
+            for line in file:
+                match = pattern.search(line)
+                if match:
+                    timestamp_str, username, ip = match.groups()
+
+                    try:
+                        # auth.log usually does not include year, so use current year
+                        current_year = datetime.now().year
+                        full_timestamp = f"{current_year} {timestamp_str}"
+                        timestamp = datetime.strptime(full_timestamp, "%Y %b %d %H:%M:%S")
+                    except ValueError:
+                        continue
+
+                    failed_attempts.append({
+                        "ip": ip,
+                        "username": username,
+                        "timestamp": timestamp
+                    })
+
+    except FileNotFoundError:
+        print(f"[!] {AUTH_LOG} not found.")
+        log_event("SSH_LOG_ERROR", "Medium", AUTH_LOG, "auth.log file not found")
+    except PermissionError:
+        print(f"[!] Permission denied reading {AUTH_LOG}.")
+        log_event("SSH_LOG_ERROR", "Medium", AUTH_LOG, "Permission denied reading auth.log")
+    except Exception as e:
+        print(f"[ERROR] Failed to parse SSH log: {e}")
+        log_event("SSH_LOG_ERROR", "Medium", AUTH_LOG, f"Unexpected parsing error: {e}")
+
+    return failed_attempts
 
 
-def run_demo(detector):
-    now = datetime.now()
-    ip = "192.168.1.100"
+def check_brute_force(attempts):
+    """
+    Trigger an alert if:
+    - 5 failed logins
+    - from same IP
+    - within 2 minutes
+    """
+    alerts = []
+    grouped_by_ip = defaultdict(list)
 
-    for i in range(5):
-        detector.process_event({"ip": ip, "time": now})
+    for attempt in attempts:
+        grouped_by_ip[attempt["ip"]].append(attempt)
+
+    for ip, ip_attempts in grouped_by_ip.items():
+        ip_attempts.sort(key=lambda item: item["timestamp"])
+
+        for i in range(len(ip_attempts)):
+            window_start = ip_attempts[i]["timestamp"]
+            window_end = window_start + timedelta(minutes=TIME_WINDOW_MINUTES)
+
+            attempts_in_window = [
+                attempt for attempt in ip_attempts
+                if window_start <= attempt["timestamp"] <= window_end
+            ]
+
+            if len(attempts_in_window) >= FAILED_LOGIN_THRESHOLD:
+                usernames = sorted(set(attempt["username"] for attempt in attempts_in_window))
+
+                msg = (
+                    f"SSH BRUTE FORCE DETECTED: IP {ip} made "
+                    f"{len(attempts_in_window)} failed login attempts within "
+                    f"{TIME_WINDOW_MINUTES} minutes. Usernames tried: {', '.join(usernames)}"
+                )
+
+                print(f"[!!!] {msg}")
+
+                log_event(
+                    "SSH_BRUTE_FORCE",
+                    "High",
+                    ip,
+                    msg
+                )
+
+                alerts.append(msg)
+                break
+
+    return alerts
+
+
+def run_ssh_check():
+    """Main function used by hids.py."""
+    attempts = parse_auth_log()
+
+    if not attempts:
+        print("[+] No failed SSH login attempts found.")
+        log_event("SSH_CHECK_OK", "Low", AUTH_LOG, "No failed SSH login attempts found")
+        return []
+
+    print(f"[*] Found {len(attempts)} failed SSH login attempt(s) in auth.log")
+
+    alerts = check_brute_force(attempts)
+
+    if not alerts:
+        print("[+] No SSH brute-force patterns detected.")
+        log_event("SSH_CHECK_OK", "Low", AUTH_LOG, "No brute-force pattern detected")
+
+    return alerts
