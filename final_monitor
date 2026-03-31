@@ -1,0 +1,59 @@
+import os
+import hashlib
+import json
+
+MONITOR_DIR = "./monitor_dir"
+BASELINE_FILE = "baseline.json"
+
+
+def hash_file(path):
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            while chunk := f.read(4096):
+                h.update(chunk)
+        return h.hexdigest()
+    except:
+        return None
+
+
+def scan_directory():
+    file_hashes = {}
+    for root, _, files in os.walk(MONITOR_DIR):
+        for f in files:
+            path = os.path.join(root, f)
+            file_hashes[path] = hash_file(path)
+    return file_hashes
+
+
+def load_baseline():
+    if not os.path.exists(BASELINE_FILE):
+        return {}
+    with open(BASELINE_FILE, "r") as f:
+        return json.load(f)
+
+
+def save_baseline(data):
+    with open(BASELINE_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
+
+def run_file_check():
+    alerts = []
+
+    current = scan_directory()
+    baseline = load_baseline()
+
+    # Detect changes
+    for file in current:
+        if file not in baseline:
+            alerts.append(f"New file detected: {file}")
+        elif current[file] != baseline[file]:
+            alerts.append(f"File modified: {file}")
+
+    for file in baseline:
+        if file not in current:
+            alerts.append(f"File deleted: {file}")
+
+    save_baseline(current)
+    return alerts
