@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""
+create_baseline.py - Create the initial SHA-256 baseline for IslandPay HIDS
+"""
+
+from file_monitor import scan_directory, save_baseline, MONITOR_DIR
+
+print(f"[*] Scanning {MONITOR_DIR} to create initial baseline...")
+hashes = scan_directory(MONITOR_DIR)
+save_baseline(hashes)
+print(f"[+] Baseline created successfully.")
+print(f"[+] Total files hashed: {len(hashes)}")
