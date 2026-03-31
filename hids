@@ -1,132 +1,42 @@
 #!/usr/bin/env python3
+"""
+hids.py - Main control script for IslandPay Host-Based Intrusion Detection System
+
+This script:
+- runs file integrity checks
+- runs SSH brute-force detection
+- writes centralized logs
+- sends desktop alerts
+"""
 
 import time
-import argparse
-import os
+from file_monitor import run_file_check
+from ssh_detector import run_ssh_check
+from alert import send_alert
+from logger import log_event
 
-try:
-    from file_monitor import run_file_check
-    from logger import log_event
-    from alert import send_alert
-    from ssh_detector import parse_log_line, BruteForceDetector, LOG_FILE as AUTH_LOG, run_demo
-except ImportError as e:
-    print(f"[IMPORT ERROR] {e}")
-    exit(1)
-
-SCAN_INTERVAL = 60
-
-
-def extract_ip(message: str) -> str:
-    try:
-        return message.split(":")[1].strip().split(" ")[0]
-    except Exception:
-        return "unknown"
-
-
-def extract_filepath(alert: str) -> str:
-    try:
-        return alert.split()[-1]
-    except Exception:
-        return "unknown"
-
-
-def run_ssh_scan():
-    detector = BruteForceDetector()
-
-    try:
-        with open(AUTH_LOG, "r", errors="ignore") as fh:
-            for line in fh:
-                event = parse_log_line(line)
-                if event:
-                    detector.process_event(event)
-    except FileNotFoundError:
-        print(f"[SSH] Log file not found: {AUTH_LOG}")
-        return []
-    except Exception as e:
-        print(f"[ERROR] SSH scan failed: {e}")
-        return []
-
-    return detector.pop_alerts()
-
-
-def run_cycle():
-    print("\n[+] Running HIDS checks...")
-
-    file_alerts = run_file_check()
-    ssh_alerts = run_ssh_scan()
-
-    all_alerts = file_alerts + ssh_alerts
-
-    # Log file alerts
-    for alert in file_alerts:
-        if "modified" in alert.lower():
-            etype, sev = "FILE_MODIFIED", "High"
-        elif "deleted" in alert.lower():
-            etype, sev = "FILE_DELETED", "High"
-        else:
-            etype, sev = "FILE_ADDED", "Medium"
-
-        filepath = extract_filepath(alert)
-        source = os.path.basename(filepath)
-
-        log_event(etype, sev, source, alert)
-
-    # Log SSH alerts
-    for alert in ssh_alerts:
-        source = extract_ip(alert)
-        log_event("SSH_BRUTE_FORCE", "High", source, alert)
-
-    # Send alerts
-    if all_alerts:
-        print(f"[!] {len(all_alerts)} alert(s) found")
-        for alert in all_alerts:
-            send_alert(alert)
-    else:
-        print("[+] System clean")
-
-    return len(all_alerts)
+CHECK_INTERVAL = 60  # seconds
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--once", action="store_true")
-    parser.add_argument("--demo", action="store_true")
-    args = parser.parse_args()
+    print("[*] IslandPay HIDS Starting...")
+    log_event("SYSTEM_START", "Low", "hids.py", "IslandPay HIDS started successfully")
 
-    print("=" * 60)
-    print("HIDS Monitoring Started")
-    print("=" * 60)
+    while True:
+        print("\n[*] Running file integrity check...")
+        file_alerts = run_file_check()
 
-    log_event("SYSTEM", "INFO", "hids.py", "Monitoring started")
+        print("[*] Running SSH brute-force check...")
+        ssh_alerts = run_ssh_check()
 
-    try:
-        if args.demo:
-            detector = BruteForceDetector()
-            run_demo(detector)
+        all_alerts = file_alerts + ssh_alerts
 
-            alerts = detector.pop_alerts()
-            for msg in alerts:
-                send_alert(msg)
-                source = extract_ip(msg)
-                log_event("SSH_BRUTE_FORCE", "High", source, msg)
+        for alert in all_alerts:
+            send_alert(alert)
 
-            return
-
-        if args.once:
-            run_cycle()
-            return
-
-        while True:
-            try:
-                count = run_cycle()
-                log_event("SYSTEM", "INFO", "hids.py", f"Cycle completed. Alerts: {count}")
-                time.sleep(SCAN_INTERVAL)
-            except Exception as e:
-                print(f"[ERROR] Cycle failed: {e}")
-
-    except KeyboardInterrupt:
-        print("\n[!] HIDS stopped")
-        log_event("SYSTEM", "INFO", "hids.py", "Stopped")
+        print(f"[*] Scan complete. {len(all_alerts)} alert(s) generated.")
+        print(f"[*] Sleeping for {CHECK_INTERVAL} seconds...\n")
+        time.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":
