@@ -1,0 +1,12 @@
+from datetime import datetime
+
+LOG_FILE = "hids.log"
+
+
+def log_event(event_type, severity, source, description):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    log_entry = f"{timestamp} | {event_type} | {severity} | {source} | {description}\n"
+
+    with open(LOG_FILE, "a") as f:
+        f.write(log_entry)
